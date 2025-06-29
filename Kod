@@ -1,0 +1,196 @@
+import os
+import time
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+import warnings
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import classification_report, precision_score
+import tensorflow as tf
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout
+from tensorflow.keras.utils import to_categorical
+
+warnings.filterwarnings('ignore')
+
+image_size = (128, 128)
+GENRES = ['blues', 'classical', 'country', 'disco', 'hiphop',
+          'jazz', 'metal', 'pop', 'reggae', 'rock']
+model_filename = "cnn_genre_model.h5"
+
+# === Ucitavanje slika i labela ===
+def load_dataset(spectrogram_path):
+    X, y = [], []
+    for genre in GENRES:
+        genre_path = os.path.join(spectrogram_path, genre)
+        if not os.path.isdir(genre_path):
+            print(f"[UPOZORENJE] Folder za zanr '{genre}' ne postoji: {genre_path}")
+            continue
+        print(f"Ucitavam slike zanra: {genre}")
+
+        first_image_shown = False  # flag da prikazemo samo prvu sliku za zanr
+
+        for file in os.listdir(genre_path):
+            if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                path = os.path.join(genre_path, file)
+                try:
+                    img = Image.open(path).convert('RGB').resize(image_size)
+
+                    # Prikaz prve slike za svaki zanr
+                    if not first_image_shown:
+                        plt.imshow(img)
+                        plt.title(f'Spektrogram za žanr: {genre}')
+                        plt.axis('off')
+                        plt.show(block=False)   # ne blokira izvršavanje
+                        plt.pause(2)            # prikaz 2 sekunde
+                        plt.close()             # zatvara prozor slike
+                        first_image_shown = True
+
+                    X.append(np.array(img))
+                    y.append(genre)
+                except Exception as e:
+                    print(f"[GRESKA] Ne mogu ucitati sliku {path}: {e}")
+    return np.array(X), np.array(y)
+
+# === Crtanje preciznosti po zanrovima ===
+def plot_genre_precision_report(report, genres):
+    precisions = []
+    labels = []
+    for genre in genres:
+        if genre in report:
+            labels.append(genre)
+            precisions.append(report[genre]['precision'])
+    plt.figure(figsize=(10,6))
+    plt.bar(labels, precisions, color='skyblue')
+    plt.ylim(0, 1)
+    plt.ylabel('Preciznost')
+    plt.title('Preciznost po zanrovima')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+# === Treniranje CNN modela ===
+def train_model(spectrogram_path):
+    print("=== Počinjem treniranje modela ===")
+    X, y = load_dataset(spectrogram_path)
+    if len(X) == 0:
+        print("[GRESKA] Nema slika za treniranje.")
+        return
+
+    print(f"Ucitano {len(X)} slika. Normalizujem podatke i kodiram labele...")
+    X = X / 255.0
+
+    encoder = LabelEncoder()
+    y_encoded = encoder.fit_transform(y)
+    y_categorical = to_categorical(y_encoded)
+
+    print("Dijelim podatke na trening i test skupove...")
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y_categorical, test_size=0.2, stratify=y_encoded, random_state=42
+    )
+
+    print("Pravim CNN model...")
+    model = Sequential([
+        Conv2D(32, (3, 3), activation='relu', input_shape=(image_size[0], image_size[1], 3)),
+        MaxPooling2D((2, 2)),
+        Conv2D(64, (3, 3), activation='relu'),
+        MaxPooling2D((2, 2)),
+        Conv2D(128, (3, 3), activation='relu'),
+        MaxPooling2D((2, 2)),
+        Flatten(),
+        Dense(128, activation='relu'),
+        Dropout(0.3),
+        Dense(len(GENRES), activation='softmax')
+    ])
+
+    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+
+    print("Počinjem treniranje...")
+    history = model.fit(
+        X_train, y_train,
+        epochs=40,
+        batch_size=32,
+        validation_split=0.1,
+        verbose=2
+    )
+
+    print(f" Trening završen. Cuvam model u fajl '{model_filename}' i klase u 'classes.npy'...")
+    model.save(model_filename)
+    np.save("classes.npy", encoder.classes_)
+
+    print("Evaluacija modela na test skupu:")
+    loss, acc = model.evaluate(X_test, y_test, verbose=0)
+    print(f"Ukupna tačnost na test skupu: {acc * 100:.2f}%")
+
+    # Predikcija i klasifikacijski izvjestaj
+    y_pred_probs = model.predict(X_test)
+    y_pred = np.argmax(y_pred_probs, axis=1)
+    y_true = np.argmax(y_test, axis=1)
+
+    report = classification_report(y_true, y_pred, target_names=encoder.classes_, output_dict=True)
+    print("\n=== Izvjestaj klasifikacije ===")
+    print(classification_report(y_true, y_pred, target_names=encoder.classes_))
+
+    # Crtanje tacnosti tokom epoha
+    plt.figure(figsize=(10,5))
+    plt.plot(history.history['accuracy'], label='Trening tcčnost')
+    plt.plot(history.history['val_accuracy'], label='Validaciona tacnost')
+    plt.xlabel('Epoha')
+    plt.ylabel('Tacnost')
+    plt.title('Tacnost tokom epoha')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    # Crtanje preciznosti po zanrovima
+    plot_genre_precision_report(report, encoder.classes_)
+
+# === Predikcija iz slike spektograma ===
+def predict_from_image(image_path):
+    if not os.path.exists(model_filename) or not os.path.exists("classes.npy"):
+        print("[GRESKA] Model ili klase nisu pronadjeni. Najprije treniraj model.")
+        return
+
+    model = load_model(model_filename)
+    classes = np.load("classes.npy")
+
+    try:
+        img = Image.open(image_path).convert('RGB').resize(image_size)
+        
+        # Prikaz slike spektrograma
+        plt.imshow(img)
+        plt.title(f'Spektrogram: {os.path.basename(image_path)}')
+        plt.axis('off')
+        plt.show()
+
+        img_array = np.array(img) / 255.0
+        img_array = np.expand_dims(img_array, axis=0)
+
+        prediction = model.predict(img_array)
+        pred_class = classes[np.argmax(prediction)]
+        print(f"🎵 Predikcija žanra za sliku '{image_path}': {pred_class}")
+
+    except Exception as e:
+        print(f"[GRESKA] Ne mogu ucitati ili predvidjeti za sliku {image_path}: {e}")
+
+# === Glavni program ===
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 3:
+        print("\nUpotreba:")
+        print("  python cnn_model.py train <putanja_do_foldera_sa_slikama>")
+        print("  python cnn_model.py predict <putanja_do_spektrogram_slike>")
+        sys.exit(1)
+
+    cmd = sys.argv[1].lower()
+    if cmd == "train":
+        spectrogram_path = sys.argv[2]
+        train_model(spectrogram_path)
+    elif cmd == "predict":
+        image_path = sys.argv[2]
+        predict_from_image(image_path)
+    else:
+        print(f"[GREŠKA] Nepoznata komanda: {cmd}")
